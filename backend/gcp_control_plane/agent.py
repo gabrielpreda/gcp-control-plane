@@ -1,6 +1,5 @@
 import logging
-import google.auth
-from google.auth.transport.requests import Request
+
 from google.adk.agents import Agent
 from google.adk.tools.mcp_tool.mcp_toolset import (
     MCPToolset,
@@ -8,62 +7,114 @@ from google.adk.tools.mcp_tool.mcp_toolset import (
 )
 
 from .config import settings
+from .mcp_auth import mcp_header_provider
 
 logger = logging.getLogger(__name__)
 
 
-def _access_token() -> str:
-    """Get a token from ADC; never use a service-account key in the container."""
-    credentials, _ = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/cloud-platform"]
-    )
-    credentials.refresh(Request())
-    return credentials.token
-
-
-def _managed_mcp(url: str) -> MCPToolset:
+def _managed_mcp(url: str, scopes: tuple[str, ...]) -> MCPToolset:
+    """Create one managed MCP connection with refreshable ADC auth."""
     return MCPToolset(
-        connection_params=StreamableHTTPConnectionParams(
-            url=url,
-            headers={"Authorization": f"Bearer {_access_token()}"},
-        )
+        connection_params=StreamableHTTPConnectionParams(url=url),
+        header_provider=mcp_header_provider(scopes),
     )
 
 
-# Keep toolset creation at import time, matching the existing prototypes.
-# The deployment process must recycle revisions before the ADC token expires.
-# Token refresh/reconnection will be made explicit before mutation support is
-# introduced; this prototype remains read-only.
-storage_mcp = _managed_mcp("https://storage.googleapis.com/storage/mcp")
-bigquery_mcp = _managed_mcp("https://bigquery.googleapis.com/mcp")
-compute_mcp = _managed_mcp("https://compute.googleapis.com/mcp")
-resource_mcp = _managed_mcp("https://cloudresourcemanager.googleapis.com/mcp")
+COMMON_INSTRUCTIONS = f"""
+You are a read-only Google Cloud operations specialist.
+
+The configured project is {settings.project_id or '(not configured)'}.
+You may inspect only these project IDs:
+{', '.join(settings.allowed_project_ids) or '(no project allowlist configured)'}.
+
+Never create, delete, update, stop, restart, resize, or otherwise mutate a
+resource. Never change IAM, billing, networking, retention policies, or data.
+Resolve the exact project, region, zone, dataset, table, bucket, service, or
+instance before making a tool call. If the request is ambiguous, ask for
+clarification. State which project and resources were inspected. Do not expose
+credentials or access tokens.
+"""
+
+
+storage_agent = Agent(
+    name="storage_specialist",
+    model=settings.model,
+    description="Inspects Cloud Storage buckets, objects, and bucket configuration.",
+    instruction=COMMON_INSTRUCTIONS
+    + "\nUse only Cloud Storage tools. Answer only Storage-related requests.",
+    tools=[
+        _managed_mcp(
+            "https://storage.googleapis.com/storage/mcp",
+            ("https://www.googleapis.com/auth/devstorage.read_only",),
+        )
+    ],
+)
+
+bigquery_agent = Agent(
+    name="bigquery_specialist",
+    model=settings.model,
+    description="Inspects BigQuery datasets and tables and runs read-only SQL.",
+    instruction=COMMON_INSTRUCTIONS
+    + "\nUse only BigQuery tools. Use read-only SQL only. Answer only BigQuery-related requests.",
+    tools=[
+        _managed_mcp(
+            "https://bigquery.googleapis.com/mcp",
+            ("https://www.googleapis.com/auth/bigquery",),
+        )
+    ],
+)
+
+compute_agent = Agent(
+    name="compute_specialist",
+    model=settings.model,
+    description="Inspects Compute Engine VMs and related compute resources.",
+    instruction=COMMON_INSTRUCTIONS
+    + "\nUse only Compute Engine tools. Answer only VM and Compute-related requests.",
+    tools=[
+        _managed_mcp(
+            "https://compute.googleapis.com/mcp",
+            ("https://www.googleapis.com/auth/compute.read-only",),
+        )
+    ],
+)
+
+cloud_run_agent = Agent(
+    name="cloud_run_specialist",
+    model=settings.model,
+    description="Inspects Cloud Run services, revisions, jobs, and service IAM state.",
+    instruction=COMMON_INSTRUCTIONS
+    + "\nUse only Cloud Run tools. Answer only Cloud Run-related requests.",
+    tools=[
+        _managed_mcp(
+            "https://run.googleapis.com/mcp",
+            ("https://www.googleapis.com/auth/run.readonly",),
+        )
+    ],
+)
+
 
 root_agent = Agent(
     name="gcp_control_plane_agent",
     model=settings.model,
+    description="Coordinates read-only inspection across four Google Cloud domains.",
     instruction=f"""
-You are a read-only Google Cloud operations assistant.
+You are the read-only coordinator for Google Cloud inspection.
 
-Use the managed MCP tools to inspect Cloud Storage, BigQuery, Compute Engine,
-and Resource Manager resources. You may inspect only these project IDs:
-{', '.join(settings.allowed_project_ids) or '(no project allowlist configured)'}.
+Delegate requests to the appropriate specialist sub-agent:
+- storage_specialist: Cloud Storage buckets and objects
+- bigquery_specialist: BigQuery datasets, tables, and read-only SQL
+- compute_specialist: Compute Engine VMs and related resources
+- cloud_run_specialist: Cloud Run services, revisions, and jobs
 
-The configured application project is {settings.project_id or '(not configured)'}.
-When the user says "current project", "this project", or "my project", use
-that configured project if it is in the allowlist. Preserve project, bucket,
-dataset, table, instance, region, and zone context from earlier conversation
-turns when the user refers to a resource indirectly.
+Do not answer Resource Manager, project hierarchy, Cloud Asset Inventory,
+Monitoring, IAM, or other unsupported requests. Say that the capability is
+currently disabled and do not call an unrelated specialist.
 
-Rules:
-- Never create, delete, update, stop, restart, resize, or mutate a resource.
-- Never change IAM, billing, networking, retention policies, or BigQuery data.
-- Resolve the exact project, region, zone, dataset, table, bucket, or instance
-  before making a tool call.
-- If the request is ambiguous, ask a clarification question.
-- State which resources and projects were inspected.
-- Do not expose credentials, access tokens, or unnecessary sensitive data.
-- Prefer concise tables and explain operational implications.
+When a request concerns more than one supported domain, delegate to each
+relevant specialist and combine their results. Treat words such as "project"
+or "my project" as context, not as a Resource Manager request.
+
+{COMMON_INSTRUCTIONS}
 """,
-    tools=[storage_mcp, bigquery_mcp, compute_mcp, resource_mcp],
+    sub_agents=[storage_agent, bigquery_agent, compute_agent, cloud_run_agent],
 )

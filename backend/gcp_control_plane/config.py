@@ -18,6 +18,9 @@ class Settings:
     )
     max_prompt_chars: int = int(os.getenv("MAX_PROMPT_CHARS", "12000"))
     request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "180"))
+    require_authenticated_identity: bool = os.getenv(
+        "REQUIRE_AUTHENTICATED_IDENTITY", "false"
+    ).lower() == "true"
 
 
 settings = Settings()

@@ -12,9 +12,10 @@ The project uses Google-managed MCP servers, ADK, Gemini on Vertex AI, a FastAPI
 - Cloud Storage inventory and configuration inspection
 - Compute Engine inventory and instance inspection
 - BigQuery metadata and safe analytical queries
-- Resource Manager project discovery
+- Cloud Run service and revision inspection
 - Plain-English responses through Gemini
 - Structured request logging
+- Durable structured audit events with request/correlation IDs
 - Separate frontend and backend services
 - Cloud Run deployment with IAM-protected backend invocation
 
@@ -55,6 +56,8 @@ See `.env.example`. The most important settings are:
 - `BACKEND_URL` for the Streamlit service
 - `PUBLIC_DEMO` for the optional public sandbox deployment mode
 - `GRANT_DEMO_IAM` for optional sandbox IAM role setup
+- `REQUIRE_AUTHENTICATED_IDENTITY` to require an IAP/proxy-provided user identity
+
 
 `ALLOWED_PROJECT_IDS` is checked for explicitly named projects by the
 application policy. Google Cloud IAM remains the authoritative authorization

@@ -36,7 +36,6 @@ gcloud services enable \
   storage.googleapis.com \
   bigquery.googleapis.com \
   compute.googleapis.com \
-  cloudresourcemanager.googleapis.com \
   logging.googleapis.com \
   --project="$PROJECT_ID"
 ```
@@ -57,7 +56,7 @@ Grant the backend only the read and runtime permissions required by the
 selected demo. Validate the exact MCP permissions in the sandbox before use.
 Typical candidates are Vertex AI User, Storage Viewer, Compute Viewer,
 BigQuery Data Viewer, BigQuery Metadata Viewer, BigQuery Job User, Resource
-Manager Browser, and Logs Writer.
+Cloud Run Viewer, and Logs Writer.
 
 At minimum, grant the backend service account permission to call the selected
 Vertex AI publisher model:
@@ -89,6 +88,10 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:$BACKEND_SERVICE_ACCOUNT" \
   --role="roles/compute.viewer"
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$BACKEND_SERVICE_ACCOUNT" \
+  --role="roles/run.viewer"
 
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:$BACKEND_SERVICE_ACCOUNT" \
@@ -258,6 +261,7 @@ export FRONTEND_SERVICE_ACCOUNT="gcp-control-plane-frontend@$PROJECT_ID.iam.gser
 export ALLOWED_PROJECT_IDS="$PROJECT_ID"
 export PUBLIC_DEMO="true"
 export GRANT_DEMO_IAM="true"
+export REQUIRE_AUTHENTICATED_IDENTITY="false"
 ```
 
 Deploy the services:
@@ -275,6 +279,11 @@ variable or set it to `false`; the services will use IAM authentication and
 `GRANT_DEMO_IAM=true` grants the backend service account the read-only product
 roles and MCP Tool User role required by the demo. It is opt-in and intended
 only for a disposable sandbox. Omit it when IAM is managed separately.
+
+Production deployments should leave `REQUIRE_AUTHENTICATED_IDENTITY=true`.
+The frontend forwards the identity supplied by IAP or another identity-aware
+proxy to the authenticated backend. Local development may set it to `false`,
+which uses the explicit `local-user` fallback.
 
 Verify that:
 

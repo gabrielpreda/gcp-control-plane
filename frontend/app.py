@@ -13,13 +13,31 @@ st.caption("Read-only inspection of authorized Google Cloud resources")
 backend_url = os.getenv("BACKEND_URL", "http://localhost:8080").rstrip("/")
 
 
-def backend_headers() -> dict[str, str]:
+def backend_headers(correlation_id: str) -> dict[str, str]:
     # Cloud Run IAM-protected services require an OIDC identity token whose
     # audience is the backend service URL.
-    if backend_url.startswith("http://localhost"):
-        return {"Content-Type": "application/json"}
-    token = id_token.fetch_id_token(Request(), backend_url)
-    return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Authenticated-User": authenticated_user(),
+        "X-Correlation-ID": correlation_id,
+    }
+    if not backend_url.startswith("http://localhost"):
+        token = id_token.fetch_id_token(Request(), backend_url)
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def authenticated_user() -> str:
+    """Read the identity supplied by IAP or another identity-aware proxy."""
+    context_headers = getattr(st.context, "headers", {})
+    identity = (
+        context_headers.get("X-Goog-Authenticated-User-Email")
+        or context_headers.get("X-Authenticated-User")
+        or context_headers.get("X-Forwarded-User")
+    )
+    if identity:
+        return identity
+    return "local-user"
 
 
 def render_tool_calls(tool_calls: list[dict[str, Any]]) -> None:
@@ -63,10 +81,9 @@ if prompt:
             try:
                 response = requests.post(
                     f"{backend_url}/query",
-                    headers=backend_headers(),
+                    headers=backend_headers(st.session_state.session_id),
                     json={
                         "prompt": prompt,
-                        "user_id": "streamlit-user",
                         "session_id": st.session_state.session_id,
                     },
                     timeout=int(os.getenv("REQUEST_TIMEOUT_SECONDS", "180")),
