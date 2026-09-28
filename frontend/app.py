@@ -9,6 +9,14 @@ from google.oauth2 import id_token
 st.set_page_config(page_title="GCP Control Plane Assistant", page_icon="☁️")
 st.title("GCP Control Plane Assistant")
 st.caption("Read-only inspection of authorized Google Cloud resources")
+st.markdown("""
+<style>
+.model-armor-alert { background: #fff3cd; border-left: 5px solid #d97706;
+  border-radius: .35rem; padding: .8rem 1rem; color: #713f12; }
+.application-guard-alert { background: #fee2e2; border-left: 5px solid #dc2626;
+  border-radius: .35rem; padding: .8rem 1rem; color: #7f1d1d; }
+</style>
+""", unsafe_allow_html=True)
 
 backend_url = os.getenv("BACKEND_URL", "http://localhost:8080").rstrip("/")
 
@@ -56,6 +64,55 @@ def render_tool_calls(tool_calls: list[dict[str, Any]]) -> None:
                 st.json(payload)
 
 
+def render_usage(usage: dict[str, Any]) -> None:
+    if not usage or not any(usage.values()):
+        return
+    st.caption(
+        f"Model: {usage.get('model_name', 'unknown')} "
+        f"({usage.get('model_version', 'unknown')}) · "
+        "Tokens — "
+        f"input: {usage.get('input_tokens', 0):,} · "
+        f"reasoning: {usage.get('reasoning_tokens', 0):,} · "
+        f"output: {usage.get('output_tokens', 0):,} · "
+        f"total: {usage.get('total_tokens', 0):,} · "
+        f"call time: {usage.get('call_time_ms', 0):,.2f} ms"
+    )
+
+
+def render_model_usage(usage: dict[str, Any]) -> None:
+    if not usage:
+        return
+    with st.expander("📊 Model usage", expanded=False):
+        st.json(usage)
+
+
+def render_guard_notice(message: str) -> None:
+    st.markdown(
+        f'<div class="application-guard-alert">🛑 <b>Guard blocked the request</b><br>{message}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_block_notice(block: dict[str, Any] | None) -> None:
+    if not block:
+        return
+    if block.get("code") == "APPLICATION_POLICY_BLOCKED":
+        render_guard_notice(block.get("message", "The application guard blocked the request."))
+    elif block.get("code") == "MODEL_ARMOR_BLOCKED":
+        render_safety_notice(block)
+
+
+def render_safety_notice(safety: dict[str, Any] | None) -> None:
+    if not safety:
+        return
+    stage = safety.get("stage", "content")
+    message = safety.get("message", "The content was blocked by Model Armor.")
+    st.markdown(
+        f'<div class="model-armor-alert">🛡️ <b>Model Armor blocked {stage}</b><br>{message}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "session_id" not in st.session_state:
@@ -67,9 +124,15 @@ if "session_id" not in st.session_state:
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
         if message["role"] == "assistant":
+            if message.get("block"):
+                render_block_notice(message["block"])
+            else:
+                st.markdown(message["content"])
             render_tool_calls(message.get("tool_calls", []))
+            render_model_usage(message.get("usage", {}))
+        else:
+            st.markdown(message["content"])
 
 prompt = st.chat_input("Ask about buckets, VMs, BigQuery, or GCP projects...")
 if prompt:
@@ -92,18 +155,54 @@ if prompt:
                 response_data = response.json()
                 answer = response_data["answer"]
                 tool_calls = response_data.get("tool_calls", [])
+                usage = response_data.get("usage", {})
+                safety_results = response_data.get("safety_results", [])
+                guard_results = response_data.get("guard_results", [])
+                block = None
+                if guard_results:
+                    block = {
+                        "code": "APPLICATION_POLICY_BLOCKED",
+                        "message": guard_results[0].get("reason") or "The application guard blocked a tool call.",
+                    }
             except requests.HTTPError as exc:
-                answer = f"Request rejected by the backend: {exc.response.text}"
+                error_payload = {}
+                try:
+                    detail = exc.response.json().get("detail", {})
+                    if isinstance(detail, dict):
+                        error_payload = detail
+                    elif isinstance(detail, str):
+                        error_payload = {"message": detail}
+                except ValueError:
+                    pass
+                block = error_payload if error_payload.get("code") in {
+                    "MODEL_ARMOR_BLOCKED", "APPLICATION_POLICY_BLOCKED"
+                } else None
+                answer = error_payload.get("message", f"Request rejected by the backend: {exc.response.text}")
                 tool_calls = []
+                usage = {}
+                safety_results = []
+                guard_results = []
             except Exception as exc:
                 answer = f"The backend could not be reached: {exc}"
                 tool_calls = []
-            st.markdown(answer)
+                usage = {}
+                safety_results = []
+                guard_results = []
+                block = None
+            if block:
+                render_block_notice(block)
+            else:
+                st.markdown(answer)
             render_tool_calls(tool_calls)
+            render_model_usage(usage)
             st.session_state.messages.append(
                 {
                     "role": "assistant",
                     "content": answer,
                     "tool_calls": tool_calls,
+                    "usage": usage,
+                    "safety_results": safety_results,
+                    "guard_results": guard_results,
+                    "block": block,
                 }
             )

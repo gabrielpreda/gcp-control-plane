@@ -16,6 +16,8 @@ The project uses Google-managed MCP servers, ADK, Gemini on Vertex AI, a FastAPI
 - Plain-English responses through Gemini
 - Structured request logging
 - Durable structured audit events with request/correlation IDs
+- Model identity, token usage, and call time in audit events and the UI
+- Deterministic pre-tool mutation guardrails and optional Model Armor screening
 - Separate frontend and backend services
 - Cloud Run deployment with IAM-protected backend invocation
 
@@ -53,10 +55,13 @@ See `.env.example`. The most important settings are:
 - `GOOGLE_CLOUD_LOCATION`
 - `ALLOWED_PROJECT_IDS`
 - `AGENT_MODEL`
+- `AGENT_MODEL_VERSION` (optional deployment/model revision label for audit)
 - `BACKEND_URL` for the Streamlit service
 - `PUBLIC_DEMO` for the optional public sandbox deployment mode
 - `GRANT_DEMO_IAM` for optional sandbox IAM role setup
 - `REQUIRE_AUTHENTICATED_IDENTITY` to require an IAP/proxy-provided user identity
+- `MODEL_ARMOR_TEMPLATE`, `MODEL_ARMOR_LOCATION`, and `MODEL_ARMOR_FAIL_CLOSED`
+  for optional Model Armor prompt/response screening
 
 
 `ALLOWED_PROJECT_IDS` is checked for explicitly named projects by the

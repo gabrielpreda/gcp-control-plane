@@ -1,5 +1,7 @@
 from dataclasses import dataclass
+import json
 import re
+from typing import Any
 
 from .config import settings
 
@@ -50,3 +52,25 @@ def check_request(prompt: str) -> PolicyDecision:
                 "The request references a project outside the configured allowlist.",
             )
     return PolicyDecision(True, "Read-only request accepted.")
+
+
+def check_tool_call(tool_name: str, arguments: Any) -> PolicyDecision:
+    """Fail closed immediately before an ADK tool is executed."""
+    name = (tool_name or "").lower()
+    try:
+        payload = json.dumps(arguments, default=str).lower()
+    except (TypeError, ValueError):
+        payload = str(arguments).lower()
+    combined = f"{name} {payload}"
+    action_tokens = set(re.findall(r"[a-z]+", name))
+    if action_tokens.intersection({"delete", "destroy", "drop", "truncate", "insert", "merge", "update", "alter", "create", "grant", "revoke", "stop", "start", "restart", "resize", "scale"}) or any(re.search(pattern, combined) for pattern in (
+        r"\b(delete|destroy|drop|truncate|insert|merge|update|alter|create)\b",
+        r"\b(grant|revoke|set.?iam|set.?policy|change.?permission)\b",
+        r"\b(stop|start|restart|resize|scale)\b",
+    )):
+        return PolicyDecision(False, "Tool call blocked: mutation-like operation detected.")
+    query_values = re.findall(r'"(?:query|sql|statement)"\s*:\s*"(.*?)"', payload)
+    for query in query_values:
+        if not re.match(r"^(select|with|show|describe|explain|--)", query.strip().lstrip("(").lower()):
+            return PolicyDecision(False, "Tool call blocked: only read-only SQL is allowed.")
+    return PolicyDecision(True, "Tool call accepted.")

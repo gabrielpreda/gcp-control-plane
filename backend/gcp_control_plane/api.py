@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import json
+import time
 import uuid
 from typing import Any
 
@@ -11,9 +12,10 @@ from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
 from .agent import root_agent
-from .audit import emit_audit
+from .audit import audit_context, emit_audit, usage_from_event
 from .config import settings
 from .policy import check_request
+from .model_armor import ModelArmorError, model_armor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,11 +40,25 @@ class QueryResponse(BaseModel):
     correlation_id: str
     answer: str
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    usage: dict[str, Any] = Field(default_factory=lambda: {
+        "model_name": settings.model,
+        "model_version": settings.model_version,
+        "input_tokens": 0,
+        "reasoning_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "call_time_ms": 0,
+    })
+    safety_results: list[dict[str, Any]] = Field(default_factory=list)
+    guard_results: list[dict[str, Any]] = Field(default_factory=list)
 
 
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "model_armor": "enabled" if model_armor.enabled else "disabled",
+    }
 
 
 @app.post("/query", response_model=QueryResponse)
@@ -77,7 +93,29 @@ async def query(
             correlation_id=correlation_id,
             reason=decision.reason,
         )
-        raise HTTPException(status_code=403, detail=decision.reason)
+        raise HTTPException(status_code=403, detail={
+            "code": "APPLICATION_POLICY_BLOCKED",
+            "stage": "guard",
+            "message": decision.reason,
+        })
+
+    safety_results: list[dict[str, Any]] = []
+    try:
+        safety_result = model_armor.sanitize(request.prompt)
+        if safety_result:
+            safety_results.append({"stage": "input", **safety_result})
+    except ModelArmorError as exc:
+        emit_audit("model_armor_blocked", request_id=request_id, correlation_id=correlation_id,
+                   stage="input", error=str(exc))
+        raise HTTPException(status_code=403, detail={
+            "code": "MODEL_ARMOR_BLOCKED", "stage": "input",
+            "message": "The request was blocked by the AI safety policy.",
+        }) from exc
+    except Exception as exc:
+        emit_audit("model_armor_error", request_id=request_id, correlation_id=correlation_id,
+                   stage="input", error_type=type(exc).__name__)
+        if settings.model_armor_fail_closed:
+            raise HTTPException(status_code=503, detail="AI safety screening is unavailable.") from exc
 
     try:
         user_id = _authenticated_user(http_request)
@@ -113,14 +151,40 @@ async def query(
         parts=[types.Part(text=request.prompt)],
     )
 
-    async def collect_response() -> tuple[list[str], list[dict[str, Any]]]:
+    async def collect_response() -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
         response_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
+        usage = {
+            "model_name": settings.model,
+            "model_version": settings.model_version,
+            "input_tokens": 0,
+            "reasoning_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "call_time_ms": 0,
+        }
         async for event in runner.run_async(
             user_id=user_id,
             session_id=session_id,
             new_message=message,
         ):
+            event_usage = usage_from_event(event)
+            if event_usage:
+                for key in ("input_tokens", "reasoning_tokens", "output_tokens", "total_tokens"):
+                    usage[key] += event_usage[key]
+                event_model_version = (
+                    getattr(event, "model_version", None)
+                    or getattr(getattr(event, "llm_response", None), "model_version", None)
+                    or settings.model_version
+                )
+                usage["model_version"] = str(event_model_version)
+                emit_audit(
+                    "llm_usage", request_id=request_id, correlation_id=correlation_id,
+                    user_id=user_id, session_id=session_id,
+                    model_name=settings.model, model_version=str(event_model_version),
+                    call_time_ms=round((time.perf_counter() - call_started) * 1000, 2),
+                    **event_usage,
+                )
             if event.content and event.content.parts:
                 for part in event.content.parts:
                     function_call = getattr(part, "function_call", None)
@@ -153,12 +217,14 @@ async def query(
 
                     if getattr(part, "text", None):
                         response_parts.append(part.text)
-        return response_parts, tool_calls
+        return response_parts, tool_calls, usage
 
+    call_started = time.perf_counter()
     try:
-        response_parts, tool_calls = await asyncio.wait_for(
-            collect_response(), timeout=settings.request_timeout_seconds
-        )
+        with audit_context(request_id=request_id, correlation_id=correlation_id):
+            response_parts, tool_calls, usage = await asyncio.wait_for(
+                collect_response(), timeout=settings.request_timeout_seconds
+            )
     except asyncio.TimeoutError as exc:
         logger.warning("request_id=%s timed_out=true", request_id)
         emit_audit(
@@ -167,6 +233,9 @@ async def query(
             correlation_id=correlation_id,
             user_id=user_id,
             session_id=session_id,
+            model_name=settings.model,
+            model_version=settings.model_version,
+            call_time_ms=round((time.perf_counter() - call_started) * 1000, 2),
         )
         raise HTTPException(status_code=504, detail="The agent request timed out.") from exc
     except Exception as exc:
@@ -178,12 +247,32 @@ async def query(
             user_id=user_id,
             session_id=session_id,
             error_type=type(exc).__name__,
+            model_name=settings.model,
+            model_version=settings.model_version,
+            call_time_ms=round((time.perf_counter() - call_started) * 1000, 2),
         )
         raise HTTPException(status_code=502, detail="The agent request failed.") from exc
 
     answer = "\n".join(response_parts).strip()
+    usage["call_time_ms"] = round((time.perf_counter() - call_started) * 1000, 2)
     if not answer:
         answer = "The agent did not return a textual answer. Check the service logs."
+    try:
+        safety_result = model_armor.sanitize(answer, response=True)
+        if safety_result:
+            safety_results.append({"stage": "output", **safety_result})
+    except ModelArmorError as exc:
+        emit_audit("model_armor_blocked", request_id=request_id, correlation_id=correlation_id,
+                   stage="output", error=str(exc))
+        raise HTTPException(status_code=502, detail={
+            "code": "MODEL_ARMOR_BLOCKED", "stage": "output",
+            "message": "The response was blocked by the AI safety policy.",
+        }) from exc
+    except Exception as exc:
+        emit_audit("model_armor_error", request_id=request_id, correlation_id=correlation_id,
+                   stage="output", error_type=type(exc).__name__)
+        if settings.model_armor_fail_closed:
+            raise HTTPException(status_code=503, detail="AI safety screening is unavailable.") from exc
     logger.info("request_id=%s completed", request_id)
     emit_audit(
         "agent_completed",
@@ -199,12 +288,34 @@ async def query(
             }
         ),
         tool_event_count=len(tool_calls),
+        model_name=usage["model_name"],
+        model_version=usage["model_version"],
+        input_tokens=usage["input_tokens"],
+        reasoning_tokens=usage["reasoning_tokens"],
+        output_tokens=usage["output_tokens"],
+        total_tokens=usage["total_tokens"],
+        call_time_ms=usage["call_time_ms"],
     )
+    guard_results = [
+        {
+            "stage": "tool",
+            "tool": event.get("tool"),
+            "status": "blocked",
+            "reason": event.get("response", {}).get("error"),
+        }
+        for event in tool_calls
+        if event.get("type") == "tool_response"
+        and isinstance(event.get("response"), dict)
+        and event["response"].get("blocked_by") == "application_tool_guard"
+    ]
     return QueryResponse(
         request_id=request_id,
         correlation_id=correlation_id,
         answer=answer,
         tool_calls=tool_calls,
+        usage=usage,
+        safety_results=safety_results,
+        guard_results=guard_results,
     )
 
 
