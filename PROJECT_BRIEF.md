@@ -16,18 +16,19 @@ Build a secure, plain-English interface for inspecting and later managing author
 
 ## Current state
 
-The initial scaffold contains Storage, BigQuery, Compute Engine, and Resource Manager managed MCP toolsets, a read-only ADK coordinator, FastAPI `/healthz` and `/query` endpoints, a Streamlit client, deployment skeleton, security documentation, and policy tests.
+The initial implementation contains Storage, BigQuery, Compute Engine, and Cloud Run managed MCP toolsets, a read-only ADK coordinator with dedicated sub-agents, FastAPI `/healthz` and `/query` endpoints, a Streamlit client, deployment skeleton, security documentation, and policy tests. Resource Manager and Cloud Asset Inventory are currently disabled.
 
-## Known limitation
+## Runtime notes
 
-Managed MCP toolsets are initialized at backend process startup with a token obtained from ADC. Before production use with long-lived instances or any mutation capability, implement and test token refresh/reconnection.
+Managed MCP toolsets obtain bearer headers through an ADK header provider, which
+refreshes ADC credentials as needed.
 
 ## Next implementation tasks
 
 1. Install pinned dependencies in a clean virtual environment.
 2. Verify the current ADK runner/session APIs against the installed ADK version.
-3. Run the backend against a sandbox GCP project with read-only permissions.
+3. Run the ADK 1.x backend against a sandbox GCP project with read-only permissions.
 4. Replace the placeholder `streamlit-user` with authenticated identity propagation.
 5. Add structured audit records and Cloud Logging correlation IDs.
-6. Add Cloud Run, Monitoring, Logging, and Security Command Center read-only agents.
+6. Add Monitoring, Logging, and Security Command Center read-only agents.
 7. Only then design the approval-based mutation executor.

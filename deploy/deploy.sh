@@ -1,15 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${PROJECT_ID:?Set PROJECT_ID}"
-: "${REGION:=us-central1}"
+# Load local configuration when deploying from the repository root. Explicit
+# shell variables still take precedence because this only fills unset values.
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
+: "${PROJECT_ID:=${GOOGLE_CLOUD_PROJECT:-}}"
+: "${PROJECT_ID:?Set PROJECT_ID or GOOGLE_CLOUD_PROJECT}"
+: "${REGION:=${GOOGLE_CLOUD_LOCATION:-us-central1}}"
 : "${BACKEND_SERVICE_ACCOUNT:?Set BACKEND_SERVICE_ACCOUNT}"
 : "${FRONTEND_SERVICE_ACCOUNT:?Set FRONTEND_SERVICE_ACCOUNT}"
 : "${ALLOWED_PROJECT_IDS:?Set ALLOWED_PROJECT_IDS}"
 : "${AGENT_MODEL:=gemini-2.5-flash}"
+: "${AGENT_MODEL_VERSION:=configured}"
+: "${MODEL_ARMOR_TEMPLATE:=}"
+: "${MODEL_ARMOR_LOCATION:=us}"
+: "${MODEL_ARMOR_FAIL_CLOSED:=true}"
 : "${REQUEST_TIMEOUT_SECONDS:=180}"
 : "${PUBLIC_DEMO:=false}"
 : "${GRANT_DEMO_IAM:=false}"
+: "${REQUIRE_AUTHENTICATED_IDENTITY:=true}"
 
 if [[ "$PUBLIC_DEMO" == "true" ]]; then
   # Intended only for an isolated demo project. This makes both run.app URLs
@@ -29,9 +44,15 @@ gcloud services enable \
   storage.googleapis.com \
   bigquery.googleapis.com \
   compute.googleapis.com \
-  cloudresourcemanager.googleapis.com \
   logging.googleapis.com \
+  modelarmor.googleapis.com \
   --project="$PROJECT_ID"
+
+# Required by the backend when it sanitizes prompts and model responses.
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$BACKEND_SERVICE_ACCOUNT" \
+  --role="roles/modelarmor.user" \
+  --quiet
 
 if [[ "$GRANT_DEMO_IAM" == "true" ]]; then
   # Opt-in grants for a disposable sandbox. Manage production IAM separately.
@@ -41,6 +62,7 @@ if [[ "$GRANT_DEMO_IAM" == "true" ]]; then
     roles/storage.viewer \
     roles/storage.objectViewer \
     roles/compute.viewer \
+    roles/run.viewer \
     roles/bigquery.metadataViewer \
     roles/bigquery.dataViewer \
     roles/bigquery.jobUser; do
@@ -57,7 +79,7 @@ gcloud run deploy gcp-control-plane-backend \
   --region="$REGION" \
   --service-account="$BACKEND_SERVICE_ACCOUNT" \
   "${BACKEND_ACCESS_FLAGS[@]}" \
-  --set-env-vars="^|^GOOGLE_CLOUD_PROJECT=$PROJECT_ID|GOOGLE_CLOUD_LOCATION=$REGION|GOOGLE_GENAI_USE_VERTEXAI=true|AGENT_MODEL=$AGENT_MODEL|ALLOWED_PROJECT_IDS=$ALLOWED_PROJECT_IDS|REQUEST_TIMEOUT_SECONDS=$REQUEST_TIMEOUT_SECONDS"
+  --set-env-vars="^|^GOOGLE_CLOUD_PROJECT=$PROJECT_ID|GOOGLE_CLOUD_LOCATION=$REGION|GOOGLE_GENAI_USE_VERTEXAI=true|AGENT_MODEL=$AGENT_MODEL|AGENT_MODEL_VERSION=$AGENT_MODEL_VERSION|ALLOWED_PROJECT_IDS=$ALLOWED_PROJECT_IDS|REQUEST_TIMEOUT_SECONDS=$REQUEST_TIMEOUT_SECONDS|REQUIRE_AUTHENTICATED_IDENTITY=$REQUIRE_AUTHENTICATED_IDENTITY|MODEL_ARMOR_TEMPLATE=$MODEL_ARMOR_TEMPLATE|MODEL_ARMOR_LOCATION=$MODEL_ARMOR_LOCATION|MODEL_ARMOR_FAIL_CLOSED=$MODEL_ARMOR_FAIL_CLOSED"
 
 BACKEND_URL="$(gcloud run services describe gcp-control-plane-backend --project="$PROJECT_ID" --region="$REGION" --format='value(status.url)')"
 
