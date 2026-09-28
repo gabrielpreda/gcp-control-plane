@@ -13,7 +13,7 @@ from .config import settings
 from .mcp_auth import mcp_header_provider
 from .policy import check_request, check_tool_call
 from .audit import current_audit_context, emit_audit
-from .model_armor import ModelArmorError, model_armor
+from .model_armor import ModelArmorBlockedError, ModelArmorError, model_armor
 
 logger = logging.getLogger(__name__)
 
@@ -72,8 +72,11 @@ def before_agent_safety(callback_context):
     prompt = _model_text(getattr(callback_context, "user_content", None))
     try:
         model_armor.sanitize(prompt)
-    except ModelArmorError:
+    except ModelArmorBlockedError:
         return _content_block("🛡️ MODEL ARMOR BLOCKED", "The prompt was blocked by the configured safety policy.")
+    except ModelArmorError:
+        if settings.model_armor_fail_closed:
+            return _content_block("🛡️ MODEL ARMOR UNAVAILABLE", "Safety screening failed, so the request was stopped.")
     except Exception:
         if settings.model_armor_fail_closed:
             return _content_block("🛡️ MODEL ARMOR BLOCKED", "Safety screening is unavailable, so the request was stopped.")
@@ -88,8 +91,11 @@ def before_model_safety(callback_context, llm_request):
     prompt = "\n".join(_model_text(content) for content in (llm_request.contents or []))
     try:
         model_armor.sanitize(prompt)
-    except ModelArmorError:
+    except ModelArmorBlockedError:
         return _armor_block("The prompt was blocked by the configured safety policy.")
+    except ModelArmorError:
+        if settings.model_armor_fail_closed:
+            return _armor_block("Model Armor screening failed, so the request was stopped.")
     except Exception:
         if settings.model_armor_fail_closed:
             return _armor_block("Safety screening is unavailable, so the request was stopped.")
@@ -101,8 +107,11 @@ def after_model_safety(callback_context, llm_response):
         return None
     try:
         model_armor.sanitize(_model_text(llm_response.content), response=True)
-    except ModelArmorError:
+    except ModelArmorBlockedError:
         return _armor_block("The model response was blocked by the configured safety policy.")
+    except ModelArmorError:
+        if settings.model_armor_fail_closed:
+            return _armor_block("Model Armor screening failed, so the response was stopped.")
     except Exception:
         if settings.model_armor_fail_closed:
             return _armor_block("Safety screening is unavailable, so the response was stopped.")

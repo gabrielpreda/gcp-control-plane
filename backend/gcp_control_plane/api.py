@@ -15,7 +15,7 @@ from .agent import root_agent
 from .audit import audit_context, emit_audit, usage_from_event
 from .config import settings
 from .policy import check_request
-from .model_armor import ModelArmorError, model_armor
+from .model_armor import ModelArmorBlockedError, ModelArmorError, model_armor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -104,13 +104,18 @@ async def query(
         safety_result = model_armor.sanitize(request.prompt)
         if safety_result:
             safety_results.append({"stage": "input", **safety_result})
-    except ModelArmorError as exc:
+    except ModelArmorBlockedError as exc:
         emit_audit("model_armor_blocked", request_id=request_id, correlation_id=correlation_id,
                    stage="input", error=str(exc))
         raise HTTPException(status_code=403, detail={
             "code": "MODEL_ARMOR_BLOCKED", "stage": "input",
             "message": "The request was blocked by the AI safety policy.",
         }) from exc
+    except ModelArmorError as exc:
+        emit_audit("model_armor_error", request_id=request_id, correlation_id=correlation_id,
+                   stage="input", error_type=type(exc).__name__, error=str(exc))
+        if settings.model_armor_fail_closed:
+            raise HTTPException(status_code=503, detail="AI safety screening is unavailable.") from exc
     except Exception as exc:
         emit_audit("model_armor_error", request_id=request_id, correlation_id=correlation_id,
                    stage="input", error_type=type(exc).__name__)
@@ -261,13 +266,18 @@ async def query(
         safety_result = model_armor.sanitize(answer, response=True)
         if safety_result:
             safety_results.append({"stage": "output", **safety_result})
-    except ModelArmorError as exc:
+    except ModelArmorBlockedError as exc:
         emit_audit("model_armor_blocked", request_id=request_id, correlation_id=correlation_id,
                    stage="output", error=str(exc))
         raise HTTPException(status_code=502, detail={
             "code": "MODEL_ARMOR_BLOCKED", "stage": "output",
             "message": "The response was blocked by the AI safety policy.",
         }) from exc
+    except ModelArmorError as exc:
+        emit_audit("model_armor_error", request_id=request_id, correlation_id=correlation_id,
+                   stage="output", error_type=type(exc).__name__, error=str(exc))
+        if settings.model_armor_fail_closed:
+            raise HTTPException(status_code=503, detail="AI safety screening is unavailable.") from exc
     except Exception as exc:
         emit_audit("model_armor_error", request_id=request_id, correlation_id=correlation_id,
                    stage="output", error_type=type(exc).__name__)

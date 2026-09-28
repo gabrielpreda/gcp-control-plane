@@ -21,6 +21,10 @@ class ModelArmorError(RuntimeError):
     pass
 
 
+class ModelArmorBlockedError(ModelArmorError):
+    """The sanitizer completed successfully and found a policy match."""
+
+
 class ModelArmor:
     def __init__(self) -> None:
         self.template = settings.model_armor_template.strip()
@@ -90,6 +94,11 @@ class ModelArmor:
     def sanitize(self, text: str, *, response: bool = False) -> dict[str, Any] | None:
         if not self.enabled:
             return
+        if not text or not text.strip():
+            logger.info(
+                "Model Armor sanitize skipped reason=empty_text response=%s", response
+            )
+            return
         operation = "sanitizeModelResponse" if response else "sanitizeUserPrompt"
         base = f"https://modelarmor.{self.location}.rep.googleapis.com/v1"
         body = {"modelResponseData": {"text": text}} if response else {"userPromptData": {"text": text}}
@@ -97,11 +106,16 @@ class ModelArmor:
         logger.info("Model Armor sanitize started operation=%s", operation)
         result = self.session.post(f"{base}/{self.template}:{operation}", json=body, timeout=15)
         if result.status_code >= 400:
+            error_body = result.text[:500].replace("\n", " ")
             logger.error(
-                "Model Armor sanitize failed operation=%s status_code=%s duration_ms=%.2f",
-                operation, result.status_code, (time.perf_counter() - started) * 1000,
+                "Model Armor sanitize failed operation=%s status_code=%s error=%s "
+                "duration_ms=%.2f",
+                operation, result.status_code, error_body,
+                (time.perf_counter() - started) * 1000,
             )
-            raise ModelArmorError(f"Model Armor returned HTTP {result.status_code}")
+            raise ModelArmorError(
+                f"Model Armor returned HTTP {result.status_code}: {error_body}"
+            )
         payload: Any = result.json()
         blocked = self._is_blocked(payload)
         match_states = self._match_states(payload)
@@ -125,7 +139,7 @@ class ModelArmor:
             "duration_ms": round((time.perf_counter() - started) * 1000, 2),
         }
         if blocked:
-            raise ModelArmorError("Model Armor blocked the content.")
+            raise ModelArmorBlockedError("Model Armor blocked the content.")
         return summary
 
 
