@@ -10,6 +10,7 @@ load_dotenv()
 class Settings:
     project_id: str = os.getenv("GOOGLE_CLOUD_PROJECT", "")
     location: str = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+    cloud_run_region: str = os.getenv("CLOUD_RUN_REGION", "us-central1")
     model: str = os.getenv("AGENT_MODEL", "gemini-2.5-flash")
     model_version: str = os.getenv("AGENT_MODEL_VERSION", "configured")
     allowed_project_ids: tuple[str, ...] = tuple(

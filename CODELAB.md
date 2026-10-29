@@ -306,12 +306,14 @@ Set deployment variables in the shell:
 ```bash
 export PROJECT_ID="your-sandbox-project"
 export REGION="us-central1"
+export GOOGLE_CLOUD_LOCATION="global"
+export AGENT_MODEL="gemini-3.8-flash"
 export BACKEND_SERVICE_ACCOUNT="gcp-control-plane-backend@$PROJECT_ID.iam.gserviceaccount.com"
 export FRONTEND_SERVICE_ACCOUNT="gcp-control-plane-frontend@$PROJECT_ID.iam.gserviceaccount.com"
 export ALLOWED_PROJECT_IDS="$PROJECT_ID"
-export PUBLIC_DEMO="true"
-export GRANT_DEMO_IAM="true"
-export REQUIRE_AUTHENTICATED_IDENTITY="false"
+export PUBLIC_DEMO="false"
+export GRANT_DEMO_IAM="false"
+export REQUIRE_AUTHENTICATED_IDENTITY="true"
 ```
 
 Deploy the services:
@@ -320,11 +322,16 @@ Deploy the services:
 ./deploy/deploy.sh
 ```
 
-`PUBLIC_DEMO=true` makes both Cloud Run services directly reachable through
-their `run.app` URLs without a load balancer or Cloud Run proxy. Use this only
-with a disposable sandbox project. For a protected deployment, omit the
-variable or set it to `false`; the services will use IAM authentication and
-`internal-and-cloud-load-balancing` ingress.
+`REGION` selects the Cloud Run deployment region. `GOOGLE_CLOUD_LOCATION`
+selects the Vertex AI model endpoint; this example uses `global` because it
+worked for the local ADK setup. Global model routing does not guarantee data
+residency or in-region processing.
+
+With `PUBLIC_DEMO=false`, the services use IAM authentication and
+`internal-and-cloud-load-balancing` ingress. Put the frontend behind an
+external HTTPS load balancer with IAP (or an equivalent identity-aware proxy)
+for browser access. Set `PUBLIC_DEMO=true` only for an isolated, disposable
+demo project; it exposes both services publicly.
 
 `GRANT_DEMO_IAM=true` grants the backend service account the read-only product
 roles and MCP Tool User role required by the demo. It is opt-in and intended

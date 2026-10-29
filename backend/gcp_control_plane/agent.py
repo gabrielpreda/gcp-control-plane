@@ -10,6 +10,7 @@ from google.adk.tools.mcp_tool.mcp_toolset import (
 from google.adk.tools.agent_tool import AgentTool
 
 from .config import settings
+from .compute_inventory import list_compute_instances
 from .mcp_auth import mcp_header_provider
 from .policy import check_request, check_tool_call
 from .audit import current_audit_context, emit_audit
@@ -126,6 +127,48 @@ def _managed_mcp(url: str, scopes: tuple[str, ...]) -> MCPToolset:
     )
 
 
+MCP_SERVERS = [
+    {
+        "id": "storage",
+        "name": "Cloud Storage MCP",
+        "url": "https://storage.googleapis.com/storage/mcp",
+        "toolset": _managed_mcp(
+            "https://storage.googleapis.com/storage/mcp",
+            ("https://www.googleapis.com/auth/devstorage.read_only",),
+        ),
+    },
+    {
+        "id": "bigquery",
+        "name": "BigQuery MCP",
+        "url": "https://bigquery.googleapis.com/mcp",
+        "toolset": _managed_mcp(
+            "https://bigquery.googleapis.com/mcp",
+            ("https://www.googleapis.com/auth/bigquery.readonly",),
+        ),
+    },
+    {
+        "id": "compute",
+        "name": "Compute Engine MCP",
+        "url": "https://compute.googleapis.com/mcp",
+        "public_tool_discovery": True,
+        "toolset": _managed_mcp(
+            "https://compute.googleapis.com/mcp",
+            ("https://www.googleapis.com/auth/compute.read-only",),
+        ),
+    },
+    {
+        "id": "cloud_run",
+        "name": "Cloud Run MCP",
+        "url": "https://run.googleapis.com/mcp",
+        "public_tool_discovery": True,
+        "toolset": _managed_mcp(
+            "https://run.googleapis.com/mcp",
+            ("https://www.googleapis.com/auth/run.readonly",),
+        ),
+    },
+]
+
+
 COMMON_INSTRUCTIONS = f"""
 You are a read-only Google Cloud operations specialist.
 
@@ -148,12 +191,7 @@ storage_agent = Agent(
     description="Inspects Cloud Storage buckets, objects, and bucket configuration.",
     instruction=COMMON_INSTRUCTIONS
     + "\nUse only Cloud Storage tools. Answer only Storage-related requests.",
-    tools=[
-        _managed_mcp(
-            "https://storage.googleapis.com/storage/mcp",
-            ("https://www.googleapis.com/auth/devstorage.read_only",),
-        )
-    ],
+    tools=[MCP_SERVERS[0]["toolset"]],
     before_tool_callback=guard_tool_call,
     before_agent_callback=[before_agent_guard, before_agent_safety],
     before_model_callback=before_model_safety,
@@ -166,12 +204,7 @@ bigquery_agent = Agent(
     description="Inspects BigQuery datasets and tables and runs read-only SQL.",
     instruction=COMMON_INSTRUCTIONS
     + "\nUse only BigQuery tools. Use read-only SQL only. Answer only BigQuery-related requests.",
-    tools=[
-        _managed_mcp(
-            "https://bigquery.googleapis.com/mcp",
-            ("https://www.googleapis.com/auth/bigquery.readonly",),
-        )
-    ],
+    tools=[MCP_SERVERS[1]["toolset"]],
     before_tool_callback=guard_tool_call,
     before_agent_callback=[before_agent_guard, before_agent_safety],
     before_model_callback=before_model_safety,
@@ -183,13 +216,8 @@ compute_agent = Agent(
     model=settings.model,
     description="Inspects Compute Engine VMs and related compute resources.",
     instruction=COMMON_INSTRUCTIONS
-    + "\nUse only Compute Engine tools. Answer only VM and Compute-related requests.",
-    tools=[
-        _managed_mcp(
-            "https://compute.googleapis.com/mcp",
-            ("https://www.googleapis.com/auth/compute.read-only",),
-        )
-    ],
+    + "\nAnswer only VM and Compute-related requests. For requests to list, count, or inspect VM inventory in the configured project, call list_compute_instances and report its returned rows and any unreachable zones. Use the Compute Engine MCP tools for other supported Compute inspections. Call only tool names explicitly available to you; never invent or infer an MCP tool name.",
+    tools=[list_compute_instances, MCP_SERVERS[2]["toolset"]],
     before_tool_callback=guard_tool_call,
     before_agent_callback=[before_agent_guard, before_agent_safety],
     before_model_callback=before_model_safety,
@@ -202,12 +230,7 @@ cloud_run_agent = Agent(
     description="Inspects Cloud Run services, revisions, jobs, and service IAM state.",
     instruction=COMMON_INSTRUCTIONS
     + "\nUse only Cloud Run tools. Answer only Cloud Run-related requests.",
-    tools=[
-        _managed_mcp(
-            "https://run.googleapis.com/mcp",
-            ("https://www.googleapis.com/auth/run.readonly",),
-        )
-    ],
+    tools=[MCP_SERVERS[3]["toolset"]],
     before_tool_callback=guard_tool_call,
     before_agent_callback=[before_agent_guard, before_agent_safety],
     before_model_callback=before_model_safety,

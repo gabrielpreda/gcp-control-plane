@@ -5,7 +5,8 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request as FastAPIRequest, Response
+from fastapi import FastAPI, HTTPException, Query, Request as FastAPIRequest, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
@@ -16,6 +17,7 @@ from .audit import audit_context, emit_audit, usage_from_event
 from .config import settings
 from .policy import check_request
 from .model_armor import ModelArmorBlockedError, ModelArmorError, model_armor
+from .overview import get_overview
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -327,6 +329,261 @@ async def query(
         safety_results=safety_results,
         guard_results=guard_results,
     )
+
+
+@app.post("/query/stream")
+async def query_stream(
+    request: QueryRequest,
+    http_request: FastAPIRequest,
+) -> StreamingResponse:
+    """Stream tool lifecycle events, then the Model-Armor-screened answer."""
+    request_id = str(uuid.uuid4())
+    correlation_id = _correlation_id(http_request, request_id)
+    emit_audit("request_received", request_id=request_id,
+               correlation_id=correlation_id, session_id=request.session_id)
+
+    decision = check_request(request.prompt)
+    emit_audit("policy_decision", request_id=request_id,
+               correlation_id=correlation_id, allowed=decision.allowed,
+               reason=decision.reason)
+    if not decision.allowed:
+        raise HTTPException(status_code=403, detail={
+            "code": "APPLICATION_POLICY_BLOCKED", "stage": "guard",
+            "message": decision.reason,
+        })
+
+    safety_results: list[dict[str, Any]] = []
+    try:
+        safety_result = model_armor.sanitize(request.prompt)
+        if safety_result:
+            safety_results.append({"stage": "input", **safety_result})
+    except ModelArmorBlockedError as exc:
+        raise HTTPException(status_code=403, detail={
+            "code": "MODEL_ARMOR_BLOCKED", "stage": "input",
+            "message": "The request was blocked by the AI safety policy.",
+        }) from exc
+    except Exception as exc:
+        if settings.model_armor_fail_closed:
+            raise HTTPException(status_code=503,
+                                detail="AI safety screening is unavailable.") from exc
+
+    user_id = _authenticated_user(http_request)
+    session_id = request.session_id or str(uuid.uuid4())
+    try:
+        await session_service.create_session(
+            app_name=APP_NAME, user_id=user_id, session_id=session_id
+        )
+    except Exception:
+        # Existing sessions are expected for follow-up turns.
+        pass
+
+    headers = {
+        "X-Request-ID": request_id,
+        "X-Correlation-ID": correlation_id,
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(
+        _query_event_stream(
+            request.prompt, user_id, session_id, request_id,
+            correlation_id, safety_results,
+        ),
+        media_type="text/event-stream",
+        headers=headers,
+    )
+
+
+async def _query_event_stream(
+    prompt: str,
+    user_id: str,
+    session_id: str,
+    request_id: str,
+    correlation_id: str,
+    safety_results: list[dict[str, Any]],
+):
+    def frame(event_name: str, payload: dict[str, Any]) -> str:
+        return f"event: {event_name}\ndata: {json.dumps(payload, default=str, separators=(',', ':'))}\n\n"
+
+    call_started = time.perf_counter()
+    tool_calls: list[dict[str, Any]] = []
+    started_by_id: dict[str, float] = {}
+    started_by_name: dict[str, list[float]] = {}
+    usage: dict[str, Any] = {
+        "model_name": settings.model,
+        "model_version": settings.model_version,
+        "input_tokens": 0,
+        "reasoning_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "call_time_ms": 0,
+    }
+    response_parts: list[str] = []
+    yield frame("request_started", {"request_id": request_id,
+                                      "correlation_id": correlation_id})
+    emit_audit("agent_started", request_id=request_id,
+               correlation_id=correlation_id, user_id=user_id,
+               session_id=session_id)
+    message = types.Content(role="user", parts=[types.Part(text=prompt)])
+
+    try:
+        with audit_context(request_id=request_id, correlation_id=correlation_id):
+            async with asyncio.timeout(settings.request_timeout_seconds):
+                async for event in runner.run_async(
+                    user_id=user_id,
+                    session_id=session_id,
+                    new_message=message,
+                ):
+                    if getattr(event, "partial", False):
+                        # Do not expose unscreened model text or incomplete tool arguments.
+                        continue
+                    event_usage = usage_from_event(event)
+                    if event_usage:
+                        for key in ("input_tokens", "reasoning_tokens",
+                                    "output_tokens", "total_tokens"):
+                            usage[key] += event_usage[key]
+                        event_model_version = (
+                            getattr(event, "model_version", None)
+                            or getattr(getattr(event, "llm_response", None),
+                                       "model_version", None)
+                            or settings.model_version
+                        )
+                        usage["model_version"] = str(event_model_version)
+                        emit_audit("llm_usage", request_id=request_id,
+                                   correlation_id=correlation_id, user_id=user_id,
+                                   session_id=session_id, model_name=settings.model,
+                                   model_version=str(event_model_version),
+                                   **event_usage)
+
+                    for part in getattr(getattr(event, "content", None), "parts", []) or []:
+                        function_call = getattr(part, "function_call", None)
+                        if function_call is not None:
+                            tool_name = getattr(function_call, "name", None) or "unknown tool"
+                            call_id = getattr(function_call, "id", None)
+                            now = time.perf_counter()
+                            if call_id:
+                                started_by_id[str(call_id)] = now
+                            else:
+                                started_by_name.setdefault(tool_name, []).append(now)
+                            call_data = {
+                                "type": "tool_call", "tool": tool_name,
+                                "id": call_id,
+                                "arguments": _safe_json_value(
+                                    getattr(function_call, "args", {})
+                                ),
+                                "author": getattr(event, "author", None),
+                            }
+                            tool_calls.append(call_data)
+                            yield frame("tool_started", call_data)
+
+                        function_response = getattr(part, "function_response", None)
+                        if function_response is not None:
+                            tool_name = getattr(function_response, "name", None) or "unknown tool"
+                            call_id = getattr(function_response, "id", None)
+                            started = started_by_id.pop(str(call_id), None) if call_id else None
+                            if started is None and started_by_name.get(tool_name):
+                                started = started_by_name[tool_name].pop(0)
+                            duration_ms = (
+                                round((time.perf_counter() - started) * 1000, 2)
+                                if started is not None else None
+                            )
+                            response_data = _safe_json_value(
+                                getattr(function_response, "response", {})
+                            )
+                            response_event = {
+                                "type": "tool_response", "tool": tool_name,
+                                "id": call_id, "response": response_data,
+                                "duration_ms": duration_ms,
+                                "author": getattr(event, "author", None),
+                            }
+                            tool_calls.append(response_event)
+                            yield frame("tool_completed", response_event)
+
+                        text = getattr(part, "text", None)
+                        if text:
+                            response_parts.append(text)
+
+        answer = "\n".join(response_parts).strip()
+        if not answer:
+            answer = "The agent did not return a textual answer. Check the service logs."
+        usage["call_time_ms"] = round((time.perf_counter() - call_started) * 1000, 2)
+
+        try:
+            safety_result = model_armor.sanitize(answer, response=True)
+            if safety_result:
+                safety_results.append({"stage": "output", **safety_result})
+        except ModelArmorBlockedError:
+            emit_audit("model_armor_blocked", request_id=request_id,
+                       correlation_id=correlation_id, stage="output")
+            yield frame("error", {
+                "code": "MODEL_ARMOR_BLOCKED", "stage": "output",
+                "message": "The response was blocked by the AI safety policy.",
+            })
+            return
+        except Exception as exc:
+            emit_audit("model_armor_error", request_id=request_id,
+                       correlation_id=correlation_id, stage="output",
+                       error_type=type(exc).__name__)
+            if settings.model_armor_fail_closed:
+                yield frame("error", {
+                    "code": "MODEL_ARMOR_UNAVAILABLE", "stage": "output",
+                    "message": "AI safety screening is unavailable.",
+                })
+                return
+
+        guard_results = [
+            {"stage": "tool", "tool": item.get("tool"), "status": "blocked",
+             "reason": item.get("response", {}).get("error")}
+            for item in tool_calls
+            if item.get("type") == "tool_response"
+            and isinstance(item.get("response"), dict)
+            and item["response"].get("blocked_by") == "application_tool_guard"
+        ]
+        emit_audit("agent_completed", request_id=request_id,
+                   correlation_id=correlation_id, user_id=user_id,
+                   session_id=session_id,
+                   tool_names=sorted({str(item.get("tool")) for item in tool_calls
+                                      if item.get("tool")}),
+                   tool_event_count=len(tool_calls), model_name=settings.model,
+                   model_version=usage["model_version"],
+                   input_tokens=usage["input_tokens"],
+                   reasoning_tokens=usage["reasoning_tokens"],
+                   output_tokens=usage["output_tokens"],
+                   total_tokens=usage["total_tokens"],
+                   call_time_ms=usage["call_time_ms"])
+        yield frame("done", {
+            "request_id": request_id, "correlation_id": correlation_id,
+            "answer": answer, "tool_calls": tool_calls, "usage": usage,
+            "safety_results": safety_results, "guard_results": guard_results,
+        })
+    except TimeoutError:
+        emit_audit("agent_timed_out", request_id=request_id,
+                   correlation_id=correlation_id, user_id=user_id,
+                   session_id=session_id, call_time_ms=round(
+                       (time.perf_counter() - call_started) * 1000, 2))
+        yield frame("error", {"code": "REQUEST_TIMEOUT",
+                              "message": "The agent request timed out."})
+    except asyncio.CancelledError:
+        emit_audit("agent_stream_cancelled", request_id=request_id,
+                   correlation_id=correlation_id, user_id=user_id,
+                   session_id=session_id)
+        raise
+    except Exception as exc:
+        logger.exception("request_id=%s agent_stream_failed=true", request_id)
+        emit_audit("agent_failed", request_id=request_id,
+                   correlation_id=correlation_id, user_id=user_id,
+                   session_id=session_id, error_type=type(exc).__name__,
+                   call_time_ms=round((time.perf_counter() - call_started) * 1000, 2))
+        yield frame("error", {"code": "AGENT_FAILED",
+                              "message": "The agent request failed."})
+
+
+@app.get("/overview")
+async def overview(
+    http_request: FastAPIRequest,
+    refresh: bool = Query(default=False),
+) -> dict[str, Any]:
+    _authenticated_user(http_request)
+    return await get_overview(force_refresh=refresh)
 
 
 def _authenticated_user(request: FastAPIRequest) -> str:
