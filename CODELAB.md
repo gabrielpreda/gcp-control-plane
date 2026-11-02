@@ -311,9 +311,9 @@ export AGENT_MODEL="gemini-3.8-flash"
 export BACKEND_SERVICE_ACCOUNT="gcp-control-plane-backend@$PROJECT_ID.iam.gserviceaccount.com"
 export FRONTEND_SERVICE_ACCOUNT="gcp-control-plane-frontend@$PROJECT_ID.iam.gserviceaccount.com"
 export ALLOWED_PROJECT_IDS="$PROJECT_ID"
-export PUBLIC_DEMO="false"
-export GRANT_DEMO_IAM="false"
-export REQUIRE_AUTHENTICATED_IDENTITY="true"
+export PUBLIC_DEMO="true"
+export GRANT_DEMO_IAM="true"
+export REQUIRE_AUTHENTICATED_IDENTITY="false"
 ```
 
 Deploy the services:
